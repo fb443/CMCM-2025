@@ -5,6 +5,8 @@ import networkx as nx
 import pandas as pd
 from gurobipy import Model, GRB, quicksum
 import os
+# top of file (once)
+import collections as _co
 
 
 # objective: punish deadheads too
@@ -315,9 +317,13 @@ def solve_carp_connected_nondepot_eid(
     alpha_dead=1.0, route_penalty=20.0,
     cover_equals_one=False,
     time_limit=None, mipfocus=1, threads=0,
-    # optional solver boosts
     heuristics=0.5, rins=20, pump_passes=20, cuts=2, presolve=-1, nodefile_start=0.0,
+    route_time_cap=60.0,
+    warmstart_routes_eid=None,          # NEW: {k:[eid,...]}
+    warmstart_routes_uv=None            # NEW: {k:[(u,v),...]}
 ):
+
+
     """
     Improvements vs. your version:
       - Feasibility-first parameters (Heuristics/RINS/FPump/Cuts/Presolve).
@@ -326,12 +332,12 @@ def solve_carp_connected_nondepot_eid(
       - Linear arc-count bound: sum_e x[e,k] <= f[k]/t_min.
     """
     # adjacency over eids
-    out_req, in_req = defaultdict(list), defaultdict(list)
+    out_req, in_req = _co.defaultdict(list), _co.defaultdict(list)
     for e in E_req:
         u_, v_ = head[e], tail[e]
         out_req[u_].append(e); in_req[v_].append(e)
 
-    out_all, in_all = defaultdict(list), defaultdict(list)
+    out_all, in_all = _co.defaultdict(list), _co.defaultdict(list)
     for e in E_all:
         u_, v_ = head[e], tail[e]
         out_all[u_].append(e); in_all[v_].append(e)
@@ -362,6 +368,7 @@ def solve_carp_connected_nondepot_eid(
     g = m.addVars(((e,k) for e in E_all for k in range(K_routes)), vtype=GRB.CONTINUOUS, lb=0.0, name="g")
     b = m.addVars(range(K_routes), vtype=GRB.CONTINUOUS, lb=0.0, name="b_touched")
 
+
     # activation
     m.addConstrs((x[e,k] <= u[k] for e in E_req for k in range(K_routes)), name="x_le_u")
     m.addConstrs((z[e,k] <= u[k] for e in E_all for k in range(K_routes)), name="z_le_u")
@@ -375,6 +382,14 @@ def solve_carp_connected_nondepot_eid(
     m.addConstrs((f[k] == quicksum(F * y[k,F] for F in F_vals) for k in range(K_routes)), name="f_equals_choice")
     Fmax = max(F_vals)
     m.addConstrs((f[k] <= Fmax * u[k] for k in range(K_routes)), name="f_zero_if_unused")
+
+    # hard upper limit on total route time (service+deadhead)
+    m.addConstrs((
+        quicksum(t_svc[e]*x[e,k] for e in E_req) +
+        quicksum(t_dead[e]*z[e,k] for e in E_all)
+        <= route_time_cap * u[k]
+        for k in range(K_routes)
+    ), name="route_duration_cap")
 
     # coverage
     if cover_equals_one:
@@ -472,6 +487,50 @@ def solve_carp_connected_nondepot_eid(
         m.Params.NodefileStart = float(nodefile_start)
     m.Params.OutputFlag = 1
 
+        # ----- Warm start (MIP start) -----
+    if warmstart_routes_eid or warmstart_routes_uv:
+        # Build a reverse map (u,v)->[eids] for mapping uv → eid if needed
+        from collections import defaultdict
+        uv2eids = defaultdict(list)
+        for e in E_all:
+            uv2eids[(head[e], tail[e])].append(e)
+
+        # Normalize to eid lists
+        ws_by_eid = {}
+        if warmstart_routes_eid:
+            # Trust given EIDs
+            for k, es in warmstart_routes_eid.items():
+                ws_by_eid[int(k)] = [int(e) for e in es if e in t_svc]
+        if warmstart_routes_uv:
+            for k, uvs in warmstart_routes_uv.items():
+                mapped = []
+                for (u,v) in uvs:
+                    cand = uv2eids.get((int(u), int(v)), [])
+                    if cand: mapped.append(cand[0])  # pick first eid for (u,v)
+                if mapped:
+                    ws_by_eid[int(k)] = mapped
+
+        # Default all starts to 0
+        for k in range(K_routes):
+            if k in u:    u[k].Start = 0
+            if k in f:    f[k].Start = 0.0
+        for (e,k) in x.keys(): x[e,k].Start = 0
+        for (e,k) in z.keys(): z[e,k].Start = 0
+
+        # Apply seeded service and route activation
+        for k, eids in ws_by_eid.items():
+            if k >= K_routes or not eids: 
+                continue
+            u[k].Start = 1
+            # crude cap guess = sum service on seeded arcs
+            f[k].Start = sum(float(t_svc[e]) for e in eids if e in t_svc)
+            for e in eids:
+                if (e,k) in x: x[e,k].Start = 1
+
+        # Slight feasibility emphasis when a start is present
+        m.Params.MIPFocus = 1
+        # m.Params.Heuristics = max(m.Params.Heuristics, 0.5)
+
     m.optimize()
     return m, x, z, f, u, a, r, g
 
@@ -496,6 +555,61 @@ def dump_memetic_like_pickle(path, model, x, fvar, A, eid_of):
     with open(path, "wb") as f:
         pickle.dump((best_cost, routes_eids, perm), f)
 
+def load_warmstart(pkl_path):
+    import pickle
+    with open(pkl_path, "rb") as f:
+        obj = pickle.load(f)
+    routes_eid = {}
+    routes_uv  = {}
+    f_by_route = {}
+    if isinstance(obj, dict):
+        if "routes_eid" in obj: routes_eid = {int(k): [int(e) for e in v] for k, v in obj["routes_eid"].items()}
+        if "routes_uv"  in obj: routes_uv  = {int(k): [(int(u), int(v)) for (u,v) in v] for k, v in obj["routes_uv"].items()}
+        if "f_by_route" in obj: f_by_route = {int(k): float(v) for k, v in obj["f_by_route"].items()}
+    elif isinstance(obj, tuple) and len(obj) >= 2:
+        # fallback: (best_cost, routes, perm) with routes as list of lists of eids or (u,v)
+        routes = obj[1]
+        if routes and routes and isinstance(routes[0], list):
+            if routes and all(isinstance(e, int) for e in routes[0]):
+                routes_eid = {k: [int(e) for e in r] for k, r in enumerate(routes)}
+            elif routes and all(isinstance(e, tuple) and len(e)==2 for e in routes[0]):
+                routes_uv  = {k: [(int(u),int(v)) for (u,v) in r] for k, r in enumerate(routes)}
+    return routes_eid, routes_uv, f_by_route
+
+def map_uv_to_eid_list(uv_list, head, tail):
+    """
+    Map [(u,v),...] to your model’s EIDs using the head/tail dictionaries you built during model setup.
+    If multiple EIDs share the same (u,v), pick the first (deterministic by enumeration).
+    """
+    # Build reverse map { (u,v): [eid,...] } once
+    from collections import defaultdict
+    uv2eids = _co.defaultdict(list)
+    for e, u in head.items():
+        uv2eids[(u, tail[e])].append(e)
+    mapped = []
+    for (u,v) in uv_list:
+        cand = uv2eids.get((u,v))
+        if not cand:
+            # tolerate missing by skipping; alternatively raise
+            continue
+        mapped.append(cand[0])
+    return mapped
+
+def load_warmstart(pkl_path):
+    import pickle
+    with open(pkl_path, "rb") as f:
+        obj = pickle.load(f)
+    routes_eid, routes_uv = {}, {}
+    if isinstance(obj, dict):
+        if "routes_eid" in obj: routes_eid = {int(k): [int(e) for e in v] for k,v in obj["routes_eid"].items()}
+        if "routes_uv"  in obj: routes_uv  = {int(k): [(int(u),int(v)) for (u,v) in v] for k,v in obj["routes_uv"].items()}
+    elif isinstance(obj, tuple) and len(obj)>=2:
+        routes = obj[1]
+        if routes and isinstance(routes[0], list) and all(isinstance(e, int) for e in routes[0]):
+            routes_eid = {k: [int(e) for e in r] for k, r in enumerate(routes)}
+        elif routes and isinstance(routes[0], list) and all(isinstance(e, tuple) and len(e)==2 for e in routes[0]):
+            routes_uv  = {k: [(int(u),int(v)) for (u,v) in r] for k, r in enumerate(routes)}
+    return routes_eid, routes_uv
 
 
 def main():
@@ -517,17 +631,28 @@ def main():
 
     # MIP controls
     ap.add_argument("--K", type=int, default=8)
-    ap.add_argument("--F", default="60,90,120,180")
+    ap.add_argument("--F", default="150,240,1440")
     ap.add_argument("--alpha-dead", type=float, default=1.0)
     ap.add_argument("--route-penalty", type=float, default=20.0)
     ap.add_argument("--time-limit", type=float, default=None)
     ap.add_argument("--mipfocus", type=int, default=1)
     ap.add_argument("--threads", type=int, default=0)
-    ap.add_argument("--require-max-cycle-min", type=float, default=180.0)
+    ap.add_argument("--require-min-cycle-min", type=float, default=0.0,
+                help="Lower bound on cycle time (minutes) to be required.")
+    ap.add_argument("--require-max-cycle-min", type=float, default=180.0,
+                    help="Upper bound on cycle time (minutes) to be required.")
+
     ap.add_argument("--autoname", action="store_true")
 
     # Outputs
     ap.add_argument("--out-pkl", default="memetic_results_from_mip_ithaca.pkl")
+    ap.add_argument("--route-time-cap", type=float, default=60.0,
+                help="Hard upper limit (minutes) on total time per route (service+deadhead).")
+    ap.add_argument("--warmstart-pkl", default=None,
+                help="Memetic pickle with routes_uv and/or routes_eid to seed a MIP start.")
+    ap.add_argument("--warmstart-use-uv", action="store_true",
+                    help="Map warm start using (u,v) pairs instead of eids.")
+
     args = ap.parse_args()
 
     # (1) parse F
@@ -577,8 +702,10 @@ def main():
                             f"{t_svc[e]:.6f}", f"{t_dead[e]:.6f}", int(req_flag[e])])
 
     # --- decide output filenames ONCE (works for both branches) ---
-    thr = args.require_max_cycle_min
-    tag = f"c{int(round(thr))}m"
+    lo = args.require_min_cycle_min
+    hi = args.require_max_cycle_min
+    tag = f"c{int(round(lo))}-{int(round(hi))}m_h1,trav240"
+
 
     if args.autoname:
         base_csv = (args.write_edges or "edges").rsplit(".", 1)
@@ -626,7 +753,10 @@ def main():
             t_dead[eid] = max(1e-3, dd_min)
 
             E_all.append(eid)
-            is_required = (cyc_min is not None) and (cyc_min <= thr)
+            # cycle: hours → minutes (may be None)
+
+            is_required = (cyc_min is not None) and (lo <= cyc_min <= hi)
+
             req_flag[eid] = is_required
             if is_required:
                 E_req.append(eid)
@@ -660,18 +790,29 @@ def main():
         raise SystemExit("Provide --graph <file> (preferred) or --edges <edges.csv>.")
 
     # Capacity sanity
-    total_service = sum(t_svc[e] for e in E_req)
-    if total_service > args.K * Fmax + 1e-9:
-        print(f"[warn] service {total_service:.1f} > K*Fmax {args.K*Fmax:.1f}")
+    Tcap = min(max(F_vals), args.route_time_cap)
+    if sum(t_svc[e] for e in E_req) > args.K * Tcap + 1e-9:
+        print(f"[warn] service {sum(t_svc[e] for e in E_req):.1f} > K*Tcap {args.K*Tcap:.1f}")
+
+    ws_eid = ws_uv = None
+    if args.warmstart_pkl:
+        tmp_eid, tmp_uv = load_warmstart(args.warmstart_pkl)
+        ws_eid = tmp_eid if (tmp_eid and not args.warmstart_use_uv) else None
+        ws_uv  = tmp_uv  if (tmp_uv  and     args.warmstart_use_uv) else None
+
 
     # Solve
     m, x, z, f, u, a, r, g = solve_carp_connected_nondepot_eid(
         V=V, E_req=E_req, E_all=E_all, head=head, tail=tail,
         t_svc=t_svc, t_dead=t_dead,
         K_routes=args.K, F_vals=F_vals,
+        route_time_cap=args.route_time_cap,
         alpha_dead=args.alpha_dead, route_penalty=args.route_penalty,
         time_limit=args.time_limit, mipfocus=args.mipfocus, threads=args.threads,
+        warmstart_routes_eid=ws_eid,
+        warmstart_routes_uv=ws_uv
     )
+
 
     status = m.Status
     print(f"[status] code={status} solcount={m.SolCount} bestbound={getattr(m, 'ObjBound', None)} obj={getattr(m, 'objVal', None)}")
